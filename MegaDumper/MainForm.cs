@@ -1721,6 +1721,21 @@ namespace Mega_Dumper
             }
         }
 
+        private static void ScyllaLog(string dumpDir, string message)
+        {
+            try
+            {
+                string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}{Environment.NewLine}";
+                if (!string.IsNullOrEmpty(dumpDir))
+                {
+                    try { Directory.CreateDirectory(dumpDir); } catch { }
+                    File.AppendAllText(Path.Combine(dumpDir, "scylla_log.txt"), line);
+                }
+                Console.Write(line);
+            }
+            catch { }
+        }
+
         private unsafe string DumpProcessLogic(uint processId, DUMP_DIRECTORIES ddirs, bool dumpNative, bool restoreFilename)
         {
             IntPtr hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, 0, processId);
@@ -2216,8 +2231,15 @@ namespace Mega_Dumper
                 }
 
                 // --- Scylla Integration Block (Before renaming to keep Address info) ---
-                if (MegaDumper.ScyllaBindings.IsAvailable)
+                ScyllaLog(ddirs.dumps, $"=== Scylla pass start for PID {processId} (process={(IntPtr.Size == 8 ? "x64" : "x86")}) ===");
+                if (!MegaDumper.ScyllaBindings.IsAvailable)
                 {
+                    ScyllaLog(ddirs.dumps, $"Scylla NOT available (DLL missing/failed to load). LastLoadError='{MegaDumper.ScyllaBindings.LastLoadError}'. Skipping import reconstruction.");
+                }
+                else
+                {
+                    ScyllaLog(ddirs.dumps, $"Scylla available. Version='{MegaDumper.ScyllaBindings.VersionInformation()}'");
+
                     // Collect all files to process
                     HashSet<string> filesToScylla = new HashSet<string>(sessionDumpedFiles);
                     try
@@ -2231,6 +2253,8 @@ namespace Mega_Dumper
                         }
                     }
                     catch { }
+
+                    ScyllaLog(ddirs.dumps, $"Candidate files: {filesToScylla.Count}");
 
                     foreach (string dumpedFile in filesToScylla)
                     {
@@ -2267,34 +2291,54 @@ namespace Mega_Dumper
                         catch { } // If check fails, assume Native/Non-System to be safe or skip? Let's proceed carefully.
 
                         // The User Requirement: "use scylla for non system files non dotnet files"
-                        if (!isDotNetFile && !isSystemFile)
+                        if (isDotNetFile || isSystemFile)
                         {
-                            try
+                            ScyllaLog(ddirs.dumps, $"SKIP '{Path.GetFileName(dumpedFile)}' (dotnet={isDotNetFile}, system={isSystemFile})");
+                            continue;
+                        }
+
+                        try
+                        {
+                            string hexAddress = fileNameNoExt.Split('_').Last();
+                            ulong imageBase = Convert.ToUInt64(hexAddress, 16);
+                            if (imageBase > 0)
                             {
-                                string hexAddress = fileNameNoExt.Split('_').Last();
-                                ulong imageBase = Convert.ToUInt64(hexAddress, 16);
-                                if (imageBase > 0)
-                                {
-                                    string scyFixFilename = Path.ChangeExtension(dumpedFile, null) + "_scyfix" + Path.GetExtension(dumpedFile);
+                                string scyFixFilename = Path.ChangeExtension(dumpedFile, null) + "_scyfix" + Path.GetExtension(dumpedFile);
 
-                                    // Use simple auto-detect logic with Scylla
-                                    MegaDumper.ScyllaBindings.FixImportsAutoDetect(
-                                        processId,
-                                        imageBase,
-                                        imageBase, // Use image base as OEP guess for raw dumps
-                                        dumpedFile,
-                                        scyFixFilename,
-                                        advancedSearch: true,
-                                        createNewIat: true);
+                                // NOTE: the line below is logged BEFORE the native call so that if
+                                // Scylla dies with an AccessViolation (uncatchable on .NET 8) the log
+                                // still identifies exactly which file/imageBase triggered the crash.
+                                ScyllaLog(ddirs.dumps, $"CALL FixImportsAutoDetect file='{Path.GetFileName(dumpedFile)}' imageBase=0x{imageBase:X}");
 
-                                    // Attempt to sanitize if successful
-                                    if (File.Exists(scyFixFilename))
-                                        SanitizeScyfixFile(scyFixFilename);
-                                }
+                                // Use simple auto-detect logic with Scylla
+                                ScyllaError result = MegaDumper.ScyllaBindings.FixImportsAutoDetect(
+                                    processId,
+                                    imageBase,
+                                    imageBase, // Use image base as OEP guess for raw dumps
+                                    dumpedFile,
+                                    scyFixFilename,
+                                    advancedSearch: true,
+                                    createNewIat: true);
+
+                                bool produced = File.Exists(scyFixFilename);
+                                ScyllaLog(ddirs.dumps, $"DONE  file='{Path.GetFileName(dumpedFile)}' result={result} scyfixCreated={produced}");
+
+                                // Attempt to sanitize if successful
+                                if (produced)
+                                    SanitizeScyfixFile(scyFixFilename);
                             }
-                            catch { }
+                            else
+                            {
+                                ScyllaLog(ddirs.dumps, $"SKIP '{Path.GetFileName(dumpedFile)}' (imageBase parse == 0)");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            ScyllaLog(ddirs.dumps, $"EXCEPTION on '{Path.GetFileName(dumpedFile)}': {ex.GetType().Name} - {ex.Message}");
                         }
                     }
+
+                    ScyllaLog(ddirs.dumps, "=== Scylla pass end ===");
                 }
 
                 // --- Renaming / Sorting Block ---
