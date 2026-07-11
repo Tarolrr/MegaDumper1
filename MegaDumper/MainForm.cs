@@ -1723,21 +1723,33 @@ namespace Mega_Dumper
 
         private static void ScyllaLog(string dumpDir, string message)
         {
+            string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}{Environment.NewLine}";
+
+            // Always write next to the exe so the log is easy to find regardless
+            // of where the dump directory ended up.
             try
             {
-                string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}{Environment.NewLine}";
-                if (!string.IsNullOrEmpty(dumpDir))
-                {
-                    try { Directory.CreateDirectory(dumpDir); } catch { }
-                    File.AppendAllText(Path.Combine(dumpDir, "scylla_log.txt"), line);
-                }
-                Console.Write(line);
+                File.AppendAllText(
+                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "scylla_log.txt"), line);
             }
             catch { }
+
+            if (!string.IsNullOrEmpty(dumpDir))
+            {
+                try
+                {
+                    Directory.CreateDirectory(dumpDir);
+                    File.AppendAllText(Path.Combine(dumpDir, "scylla_log.txt"), line);
+                }
+                catch { }
+            }
+
+            try { Console.Write(line); } catch { }
         }
 
         private unsafe string DumpProcessLogic(uint processId, DUMP_DIRECTORIES ddirs, bool dumpNative, bool restoreFilename)
         {
+            ScyllaLog(ddirs.dumps, $"DumpProcessLogic start: PID={processId} dumper={(IntPtr.Size == 8 ? "x64" : "x86")} dumpNative={dumpNative} dumpsDir='{ddirs.dumps}'");
             IntPtr hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, 0, processId);
             List<string> sessionDumpedFiles = new List<string>();
 
