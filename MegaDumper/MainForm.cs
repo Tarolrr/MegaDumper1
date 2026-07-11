@@ -1747,6 +1747,56 @@ namespace Mega_Dumper
             try { Console.Write(line); } catch { }
         }
 
+        // Runs Scylla import reconstruction for a single file in an isolated child
+        // process (the same exe with --scylla-fix). Returns the worker exit code
+        // (0=success, 1=scylla error, 2=bad args, -1=timeout, -2=launch failed).
+        private static int RunScyllaIsolated(uint processId, string dumpedFile, ulong imageBase, string scyFixFilename, string dumpDir)
+        {
+            try
+            {
+                string exePath = Process.GetCurrentProcess().MainModule.FileName;
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = exePath,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                };
+                psi.ArgumentList.Add("--scylla-fix");
+                psi.ArgumentList.Add("--pid");
+                psi.ArgumentList.Add(processId.ToString());
+                psi.ArgumentList.Add("--file");
+                psi.ArgumentList.Add(dumpedFile);
+                psi.ArgumentList.Add("--imagebase");
+                psi.ArgumentList.Add(imageBase.ToString("X"));
+                psi.ArgumentList.Add("--output");
+                psi.ArgumentList.Add(scyFixFilename);
+
+                using (Process p = Process.Start(psi))
+                {
+                    // Drain stdout/stderr so the child never blocks on a full pipe.
+                    p.OutputDataReceived += (s, e) => { };
+                    p.ErrorDataReceived += (s, e) => { };
+                    p.BeginOutputReadLine();
+                    p.BeginErrorReadLine();
+
+                    if (!p.WaitForExit(60000))
+                    {
+                        try { p.Kill(true); } catch { }
+                        ScyllaLog(dumpDir, $"WORKER TIMEOUT on '{Path.GetFileName(dumpedFile)}' (killed)");
+                        return -1;
+                    }
+                    return p.ExitCode;
+                }
+            }
+            catch (Exception ex)
+            {
+                ScyllaLog(dumpDir, $"WORKER LAUNCH FAILED on '{Path.GetFileName(dumpedFile)}': {ex.GetType().Name} - {ex.Message}");
+                return -2;
+            }
+        }
+
         private unsafe string DumpProcessLogic(uint processId, DUMP_DIRECTORIES ddirs, bool dumpNative, bool restoreFilename)
         {
             ScyllaLog(ddirs.dumps, $"DumpProcessLogic start: PID={processId} dumper={(IntPtr.Size == 8 ? "x64" : "x86")} dumpNative={dumpNative} dumpsDir='{ddirs.dumps}'");
@@ -2252,6 +2302,26 @@ namespace Mega_Dumper
                 {
                     ScyllaLog(ddirs.dumps, $"Scylla available. Version='{MegaDumper.ScyllaBindings.VersionInformation()}'");
 
+                    // Build a map of the target's loaded modules so we can skip OS/system
+                    // DLLs (kernelbase/user32/...). Reconstructing them is pointless and
+                    // they are among the regions that tend to corrupt Scylla's heap.
+                    Dictionary<ulong, string> moduleMap = new Dictionary<ulong, string>();
+                    string winDir = string.Empty;
+                    try { winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows); } catch { }
+                    try
+                    {
+                        using (Process target = Process.GetProcessById((int)processId))
+                        {
+                            foreach (ProcessModule m in target.Modules)
+                            {
+                                ulong b = (ulong)m.BaseAddress.ToInt64();
+                                if (!moduleMap.ContainsKey(b)) moduleMap[b] = m.FileName ?? string.Empty;
+                            }
+                        }
+                        ScyllaLog(ddirs.dumps, $"Target modules enumerated: {moduleMap.Count}");
+                    }
+                    catch (Exception ex) { ScyllaLog(ddirs.dumps, $"Module enumeration failed: {ex.GetType().Name} - {ex.Message}"); }
+
                     // Collect all files to process
                     HashSet<string> filesToScylla = new HashSet<string>(sessionDumpedFiles);
                     try
@@ -2315,25 +2385,30 @@ namespace Mega_Dumper
                             ulong imageBase = Convert.ToUInt64(hexAddress, 16);
                             if (imageBase > 0)
                             {
+                                // Skip OS/system modules by module path (the FileVersionInfo
+                                // check above does not work on raw memory dumps).
+                                if (moduleMap.TryGetValue(imageBase, out string modPath)
+                                    && !string.IsNullOrEmpty(modPath)
+                                    && !string.IsNullOrEmpty(winDir)
+                                    && modPath.StartsWith(winDir, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    ScyllaLog(ddirs.dumps, $"SKIP '{Path.GetFileName(dumpedFile)}' (system module: {modPath})");
+                                    continue;
+                                }
+
                                 string scyFixFilename = Path.ChangeExtension(dumpedFile, null) + "_scyfix" + Path.GetExtension(dumpedFile);
 
-                                // NOTE: the line below is logged BEFORE the native call so that if
-                                // Scylla dies with an AccessViolation (uncatchable on .NET 8) the log
-                                // still identifies exactly which file/imageBase triggered the crash.
-                                ScyllaLog(ddirs.dumps, $"CALL FixImportsAutoDetect file='{Path.GetFileName(dumpedFile)}' imageBase=0x{imageBase:X}");
+                                // NOTE: logged BEFORE launching the worker so the culprit
+                                // file/imageBase is recorded even if the worker dies with an
+                                // uncatchable native fault.
+                                ScyllaLog(ddirs.dumps, $"CALL (isolated) file='{Path.GetFileName(dumpedFile)}' imageBase=0x{imageBase:X}");
 
-                                // Use simple auto-detect logic with Scylla
-                                MegaDumper.ScyllaError result = MegaDumper.ScyllaBindings.FixImportsAutoDetect(
-                                    processId,
-                                    imageBase,
-                                    imageBase, // Use image base as OEP guess for raw dumps
-                                    dumpedFile,
-                                    scyFixFilename,
-                                    advancedSearch: true,
-                                    createNewIat: true);
+                                // Run Scylla in an isolated child process; a native crash /
+                                // heap-corruption fail-fast there cannot kill this dumper.
+                                int exitCode = RunScyllaIsolated(processId, dumpedFile, imageBase, scyFixFilename, ddirs.dumps);
 
                                 bool produced = File.Exists(scyFixFilename);
-                                ScyllaLog(ddirs.dumps, $"DONE  file='{Path.GetFileName(dumpedFile)}' result={result} scyfixCreated={produced}");
+                                ScyllaLog(ddirs.dumps, $"DONE  file='{Path.GetFileName(dumpedFile)}' workerExit={exitCode} scyfixCreated={produced}");
 
                                 // Attempt to sanitize if successful
                                 if (produced)
