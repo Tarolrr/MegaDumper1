@@ -1,6 +1,8 @@
 #include "FunctionExport.h"
 
 #include <windows.h>
+#include <cstdio>
+#include <cstdarg>
 
 #include "ApiReader.h"
 #include "AppInfo.h"
@@ -15,6 +17,36 @@
 extern HINSTANCE hDllModule;
 
 int InitializeGui(HINSTANCE hInstance, LPARAM param);
+
+// Lightweight diagnostic logger. Writes "scylla_native_log.txt" next to the
+// loaded Scylla.dll so the native side can be traced even when a call faults
+// (an AccessViolation on .NET 8 is uncatchable by the managed caller, so the
+// managed log stops at "CALL ..."; this file shows how far the native code got).
+static void ScyllaNativeLog(const char* fmt, ...) {
+  char msg[1024];
+  va_list args;
+  va_start(args, fmt);
+  _vsnprintf_s(msg, sizeof(msg), _TRUNCATE, fmt, args);
+  va_end(args);
+
+  WCHAR path[MAX_PATH] = {0};
+  if (GetModuleFileNameW(hDllModule, path, _countof(path)) != 0) {
+    WCHAR* lastSlash = wcsrchr(path, L'\\');
+    if (lastSlash) *(lastSlash + 1) = L'\0';
+    wcsncat_s(path, _countof(path), L"scylla_native_log.txt", _TRUNCATE);
+  } else {
+    wcscpy_s(path, _countof(path), L"scylla_native_log.txt");
+  }
+
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, path, L"a") == 0 && f) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "[%02d:%02d:%02d.%03d] %s\n", st.wHour, st.wMinute, st.wSecond,
+            st.wMilliseconds, msg);
+    fclose(f);
+  }
+}
 
 const WCHAR* WINAPI ScyllaVersionInformationW() {
   return APPNAME L" " ARCHITECTURE L" " APPVERSION;
@@ -93,9 +125,14 @@ BOOL WINAPI ScyllaDumpCurrentProcessW(const WCHAR* fileToDump,
 BOOL WINAPI ScyllaDumpProcessW(DWORD_PTR pid, const WCHAR* fileToDump,
                                DWORD_PTR imagebase, DWORD_PTR entrypoint,
                                const WCHAR* fileResult) {
+  ScyllaNativeLog("ScyllaDumpProcessW: pid=%u imagebase=0x%p entrypoint=0x%p",
+                  (DWORD)pid, (void*)imagebase, (void*)entrypoint);
   if (ProcessAccessHelp::openProcessHandle((DWORD)pid)) {
-    return DumpProcessW(fileToDump, imagebase, entrypoint, fileResult);
+    BOOL r = DumpProcessW(fileToDump, imagebase, entrypoint, fileResult);
+    ScyllaNativeLog("ScyllaDumpProcessW: result=%d", r);
+    return r;
   } else {
+    ScyllaNativeLog("ScyllaDumpProcessW: openProcessHandle FAILED");
     return FALSE;
   }
 }
@@ -166,9 +203,22 @@ INT WINAPI ScyllaStartGui(DWORD dwProcessId, HINSTANCE mod,
   return InitializeGui(hDllModule, (LPARAM)&guiParam);
 }
 
-int WINAPI ScyllaIatSearch(DWORD dwProcessId, DWORD_PTR imagebase,
-                           DWORD_PTR* iatStart, DWORD* iatSize,
-                           DWORD_PTR searchStart, BOOL advancedSearch) {
+// SEH filter: C++ `catch(...)` under the default /EHsc does NOT catch hardware
+// faults (AccessViolation etc.). Scylla routinely dereferences addresses in the
+// target while scanning garbage/partial regions, so those faults must be caught
+// with SEH or they kill the managed host. The real bodies live in *Impl and are
+// invoked from thin exported wrappers guarded by __try/__except.
+static int ScyllaSehFilter(const char* fn, DWORD code) {
+  ScyllaNativeLog("%s: SEH EXCEPTION 0x%08X -> returning error code", fn, code);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static int ScyllaIatSearchImpl(DWORD dwProcessId, DWORD_PTR imagebase,
+                               DWORD_PTR* iatStart, DWORD* iatSize,
+                               DWORD_PTR searchStart, BOOL advancedSearch) {
+  ScyllaNativeLog(
+      "ScyllaIatSearch: pid=%u imagebase=0x%p searchStart=0x%p advanced=%d",
+      dwProcessId, (void*)imagebase, (void*)searchStart, advancedSearch);
   try {
     ApiReader apiReader;
     ProcessLister processLister;
@@ -237,9 +287,130 @@ int WINAPI ScyllaIatSearch(DWORD dwProcessId, DWORD_PTR imagebase,
     ProcessAccessHelp::closeProcessHandle();
     apiReader.clearAll();
 
+    ScyllaNativeLog("ScyllaIatSearch: retVal=%d iatStart=0x%p iatSize=0x%X",
+                    retVal, (void*)(iatStart ? *iatStart : 0),
+                    iatSize ? *iatSize : 0);
     return retVal;
   } catch (...) {
+    ScyllaNativeLog("ScyllaIatSearch: EXCEPTION caught -> SCY_ERROR_IATSEARCH");
     return SCY_ERROR_IATSEARCH;
+  }
+}
+
+int WINAPI ScyllaIatSearch(DWORD dwProcessId, DWORD_PTR imagebase,
+                           DWORD_PTR* iatStart, DWORD* iatSize,
+                           DWORD_PTR searchStart, BOOL advancedSearch) {
+  __try {
+    return ScyllaIatSearchImpl(dwProcessId, imagebase, iatStart, iatSize,
+                               searchStart, advancedSearch);
+  } __except (ScyllaSehFilter("ScyllaIatSearch", GetExceptionCode())) {
+    return SCY_ERROR_IATSEARCH;
+  }
+}
+
+static int ScyllaIatFixAutoWImpl(DWORD dwProcessId, DWORD_PTR imagebase,
+                                 DWORD_PTR iatAddr, DWORD iatSize,
+                                 BOOL createNewIat, const WCHAR* dumpFile,
+                                 const WCHAR* iatFixFile) {
+  ScyllaNativeLog(
+      "ScyllaIatFixAutoW: pid=%u imagebase=0x%p iatAddr=0x%p iatSize=0x%X "
+      "createNewIat=%d",
+      dwProcessId, (void*)imagebase, (void*)iatAddr, iatSize, createNewIat);
+  // NOTE: this function previously had NO exception handling; a fault here
+  // propagated out and killed the managed host. Wrapped so failures are logged
+  // and reported as an error code instead of crashing.
+  try {
+    ApiReader apiReader;
+    ProcessLister processLister;
+    Process* processPtr = 0;
+    std::map<DWORD_PTR, ImportModuleThunk> moduleList;
+
+    std::vector<Process>& processList =
+        processLister.getProcessListSnapshotNative();
+    for (std::vector<Process>::iterator it = processList.begin();
+         it != processList.end(); ++it) {
+      if (it->PID == dwProcessId) {
+        processPtr = &(*it);
+        break;
+      }
+    }
+
+    if (!processPtr) {
+      ScyllaNativeLog("ScyllaIatFixAutoW: PID not found");
+      return SCY_ERROR_PIDNOTFOUND;
+    }
+
+    ProcessAccessHelp::closeProcessHandle();
+    apiReader.clearAll();
+
+    if (!ProcessAccessHelp::openProcessHandle(processPtr->PID)) {
+      ScyllaNativeLog("ScyllaIatFixAutoW: openProcessHandle FAILED");
+      return SCY_ERROR_PROCOPEN;
+    }
+
+    ProcessAccessHelp::getProcessModules(ProcessAccessHelp::hProcess,
+                                         ProcessAccessHelp::moduleList);
+
+    ProcessAccessHelp::selectedModule = 0;
+    if (imagebase == 0 || imagebase == processPtr->imageBase) {
+      ProcessAccessHelp::targetImageBase = processPtr->imageBase;
+      ProcessAccessHelp::targetSizeOfImage = processPtr->imageSize;
+    } else {
+      auto module_it =
+          std::find_if(ProcessAccessHelp::moduleList.cbegin(),
+                       ProcessAccessHelp::moduleList.cend(),
+                       [&](auto& mod) { return mod.modBaseAddr == imagebase; });
+      if (module_it == ProcessAccessHelp::moduleList.cend()) {
+        // Hidden module bypass with SAFE size detection
+        ProcessAccessHelp::targetImageBase = imagebase;
+        ProcessAccessHelp::targetSizeOfImage = ProcessAccessHelp::getSizeOfImageProcess(ProcessAccessHelp::hProcess, imagebase);
+        if (ProcessAccessHelp::targetSizeOfImage == 0) ProcessAccessHelp::targetSizeOfImage = 0x2000000; // 32MB Fallback
+      } else {
+        ProcessAccessHelp::targetImageBase = module_it->modBaseAddr;
+        ProcessAccessHelp::targetSizeOfImage = module_it->modBaseSize;
+      }
+    }
+    ScyllaNativeLog(
+        "ScyllaIatFixAutoW: targetImageBase=0x%p targetSizeOfImage=0x%X",
+        (void*)ProcessAccessHelp::targetImageBase,
+        (DWORD)ProcessAccessHelp::targetSizeOfImage);
+
+    apiReader.readApisFromModuleList();
+    ScyllaNativeLog("ScyllaIatFixAutoW: readApisFromModuleList done");
+
+    apiReader.readAndParseIAT(iatAddr, iatSize, moduleList);
+    ScyllaNativeLog("ScyllaIatFixAutoW: readAndParseIAT done, modules=%zu",
+                    moduleList.size());
+
+    // add IAT section to dump
+    ImportRebuilder importRebuild(dumpFile);
+    // FIX: Force Output ImageBase to match Runtime Base (prevents crash on hidden modules)
+    importRebuild.setImageBase(ProcessAccessHelp::targetImageBase);
+
+    IATReferenceScan iatReferenceScan{};
+    importRebuild.enableOFTSupport();
+    if (createNewIat) {
+      importRebuild.iatReferenceScan = &iatReferenceScan;
+      importRebuild.enableNewIatInSection(iatAddr, iatSize);
+    }
+
+    int retVal = SCY_ERROR_IATWRITE;
+
+    if (importRebuild.rebuildImportTable(iatFixFile, moduleList)) {
+      retVal = SCY_ERROR_SUCCESS;
+    }
+
+    processList.clear();
+    moduleList.clear();
+    ProcessAccessHelp::closeProcessHandle();
+    apiReader.clearAll();
+
+    ScyllaNativeLog("ScyllaIatFixAutoW: retVal=%d", retVal);
+    return retVal;
+  } catch (...) {
+    ScyllaNativeLog(
+        "ScyllaIatFixAutoW: EXCEPTION caught -> SCY_ERROR_IATWRITE");
+    return SCY_ERROR_IATWRITE;
   }
 }
 
@@ -247,79 +418,10 @@ int WINAPI ScyllaIatFixAutoW(DWORD dwProcessId, DWORD_PTR imagebase,
                              DWORD_PTR iatAddr, DWORD iatSize,
                              BOOL createNewIat, const WCHAR* dumpFile,
                              const WCHAR* iatFixFile) {
-  ApiReader apiReader;
-  ProcessLister processLister;
-  Process* processPtr = 0;
-  std::map<DWORD_PTR, ImportModuleThunk> moduleList;
-
-  std::vector<Process>& processList =
-      processLister.getProcessListSnapshotNative();
-  for (std::vector<Process>::iterator it = processList.begin();
-       it != processList.end(); ++it) {
-    if (it->PID == dwProcessId) {
-      processPtr = &(*it);
-      break;
-    }
+  __try {
+    return ScyllaIatFixAutoWImpl(dwProcessId, imagebase, iatAddr, iatSize,
+                                 createNewIat, dumpFile, iatFixFile);
+  } __except (ScyllaSehFilter("ScyllaIatFixAutoW", GetExceptionCode())) {
+    return SCY_ERROR_IATWRITE;
   }
-
-  if (!processPtr) return SCY_ERROR_PIDNOTFOUND;
-
-  ProcessAccessHelp::closeProcessHandle();
-  apiReader.clearAll();
-
-  if (!ProcessAccessHelp::openProcessHandle(processPtr->PID)) {
-    return SCY_ERROR_PROCOPEN;
-  }
-
-  ProcessAccessHelp::getProcessModules(ProcessAccessHelp::hProcess,
-                                       ProcessAccessHelp::moduleList);
-
-  ProcessAccessHelp::selectedModule = 0;
-  if (imagebase == 0 || imagebase == processPtr->imageBase) {
-    ProcessAccessHelp::targetImageBase = processPtr->imageBase;
-    ProcessAccessHelp::targetSizeOfImage = processPtr->imageSize;
-  } else {
-    auto module_it =
-        std::find_if(ProcessAccessHelp::moduleList.cbegin(),
-                     ProcessAccessHelp::moduleList.cend(),
-                     [&](auto& mod) { return mod.modBaseAddr == imagebase; });
-    if (module_it == ProcessAccessHelp::moduleList.cend()) {
-      // Hidden module bypass with SAFE size detection
-      ProcessAccessHelp::targetImageBase = imagebase;
-      ProcessAccessHelp::targetSizeOfImage = ProcessAccessHelp::getSizeOfImageProcess(ProcessAccessHelp::hProcess, imagebase);
-      if (ProcessAccessHelp::targetSizeOfImage == 0) ProcessAccessHelp::targetSizeOfImage = 0x2000000; // 32MB Fallback
-    } else {
-      ProcessAccessHelp::targetImageBase = module_it->modBaseAddr;
-      ProcessAccessHelp::targetSizeOfImage = module_it->modBaseSize;
-    }
-  }
-
-  apiReader.readApisFromModuleList();
-
-  apiReader.readAndParseIAT(iatAddr, iatSize, moduleList);
-
-  // add IAT section to dump
-  ImportRebuilder importRebuild(dumpFile);
-  // FIX: Force Output ImageBase to match Runtime Base (prevents crash on hidden modules)
-  importRebuild.setImageBase(ProcessAccessHelp::targetImageBase);
-  
-  IATReferenceScan iatReferenceScan{};
-  importRebuild.enableOFTSupport();
-  if (createNewIat) {
-    importRebuild.iatReferenceScan = &iatReferenceScan;
-    importRebuild.enableNewIatInSection(iatAddr, iatSize);
-  }
-
-  int retVal = SCY_ERROR_IATWRITE;
-
-  if (importRebuild.rebuildImportTable(iatFixFile, moduleList)) {
-    retVal = SCY_ERROR_SUCCESS;
-  }
-
-  processList.clear();
-  moduleList.clear();
-  ProcessAccessHelp::closeProcessHandle();
-  apiReader.clearAll();
-
-  return retVal;
 }

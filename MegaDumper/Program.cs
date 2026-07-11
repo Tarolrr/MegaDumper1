@@ -58,6 +58,17 @@ namespace Mega_Dumper
             Application.ThreadException += Application_ThreadException;
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
 
+            // Isolated Scylla worker mode: reconstruct imports for a SINGLE dump
+            // file in this dedicated child process. Scylla can corrupt its own
+            // heap on bad/garbage regions, which later triggers an uncatchable
+            // fail-fast; running it here means such a crash only kills this
+            // worker, not the parent dumper. Handled before AllocConsole/GUI.
+            if (args != null && args.Length > 0 &&
+                Array.Exists(args, a => string.Equals(a, "--scylla-fix", StringComparison.OrdinalIgnoreCase)))
+            {
+                return RunScyllaWorker(args);
+            }
+
             // No args -> normal GUI mode
             if (args == null || args.Length == 0)
             {
@@ -197,6 +208,58 @@ namespace Mega_Dumper
             {
                 Console.Error.WriteLine($"Unhandled exception: {ex}");
                 Console.Error.WriteLine("Exiting with error.");
+                return 1;
+            }
+        }
+
+        /// <summary>
+        /// Isolated worker: runs Scylla import reconstruction for a single dump file.
+        /// Exit codes: 0=Success, 1=Scylla error/exception, 2=bad usage.
+        /// A native fail-fast/AV inside Scylla terminates only this process.
+        /// </summary>
+        private static int RunScyllaWorker(string[] args)
+        {
+            uint pid = 0;
+            string file = null;
+            string output = null;
+            ulong imageBase = 0;
+
+            for (int i = 0; i < args.Length; i++)
+            {
+                switch (args[i].ToLowerInvariant())
+                {
+                    case "--pid":
+                        if (i + 1 < args.Length) uint.TryParse(args[++i], out pid);
+                        break;
+                    case "--file":
+                        if (i + 1 < args.Length) file = args[++i];
+                        break;
+                    case "--output":
+                        if (i + 1 < args.Length) output = args[++i];
+                        break;
+                    case "--imagebase":
+                        if (i + 1 < args.Length)
+                            ulong.TryParse(args[++i], System.Globalization.NumberStyles.HexNumber,
+                                System.Globalization.CultureInfo.InvariantCulture, out imageBase);
+                        break;
+                }
+            }
+
+            if (pid == 0 || string.IsNullOrEmpty(file) || string.IsNullOrEmpty(output) || imageBase == 0)
+                return 2;
+
+            try
+            {
+                // Scylla opens the target process; make sure this worker holds
+                // SeDebugPrivilege just like the main dump path does.
+                try { new MainForm().EnableDebuggerPrivileges(); } catch { }
+
+                MegaDumper.ScyllaError result = MegaDumper.ScyllaBindings.FixImportsAutoDetect(
+                    pid, imageBase, imageBase, file, output, advancedSearch: true, createNewIat: true);
+                return result == MegaDumper.ScyllaError.Success ? 0 : 1;
+            }
+            catch
+            {
                 return 1;
             }
         }
