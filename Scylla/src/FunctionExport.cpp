@@ -203,9 +203,19 @@ INT WINAPI ScyllaStartGui(DWORD dwProcessId, HINSTANCE mod,
   return InitializeGui(hDllModule, (LPARAM)&guiParam);
 }
 
-int WINAPI ScyllaIatSearch(DWORD dwProcessId, DWORD_PTR imagebase,
-                           DWORD_PTR* iatStart, DWORD* iatSize,
-                           DWORD_PTR searchStart, BOOL advancedSearch) {
+// SEH filter: C++ `catch(...)` under the default /EHsc does NOT catch hardware
+// faults (AccessViolation etc.). Scylla routinely dereferences addresses in the
+// target while scanning garbage/partial regions, so those faults must be caught
+// with SEH or they kill the managed host. The real bodies live in *Impl and are
+// invoked from thin exported wrappers guarded by __try/__except.
+static int ScyllaSehFilter(const char* fn, DWORD code) {
+  ScyllaNativeLog("%s: SEH EXCEPTION 0x%08X -> returning error code", fn, code);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static int ScyllaIatSearchImpl(DWORD dwProcessId, DWORD_PTR imagebase,
+                               DWORD_PTR* iatStart, DWORD* iatSize,
+                               DWORD_PTR searchStart, BOOL advancedSearch) {
   ScyllaNativeLog(
       "ScyllaIatSearch: pid=%u imagebase=0x%p searchStart=0x%p advanced=%d",
       dwProcessId, (void*)imagebase, (void*)searchStart, advancedSearch);
@@ -287,10 +297,21 @@ int WINAPI ScyllaIatSearch(DWORD dwProcessId, DWORD_PTR imagebase,
   }
 }
 
-int WINAPI ScyllaIatFixAutoW(DWORD dwProcessId, DWORD_PTR imagebase,
-                             DWORD_PTR iatAddr, DWORD iatSize,
-                             BOOL createNewIat, const WCHAR* dumpFile,
-                             const WCHAR* iatFixFile) {
+int WINAPI ScyllaIatSearch(DWORD dwProcessId, DWORD_PTR imagebase,
+                           DWORD_PTR* iatStart, DWORD* iatSize,
+                           DWORD_PTR searchStart, BOOL advancedSearch) {
+  __try {
+    return ScyllaIatSearchImpl(dwProcessId, imagebase, iatStart, iatSize,
+                               searchStart, advancedSearch);
+  } __except (ScyllaSehFilter("ScyllaIatSearch", GetExceptionCode())) {
+    return SCY_ERROR_IATSEARCH;
+  }
+}
+
+static int ScyllaIatFixAutoWImpl(DWORD dwProcessId, DWORD_PTR imagebase,
+                                 DWORD_PTR iatAddr, DWORD iatSize,
+                                 BOOL createNewIat, const WCHAR* dumpFile,
+                                 const WCHAR* iatFixFile) {
   ScyllaNativeLog(
       "ScyllaIatFixAutoW: pid=%u imagebase=0x%p iatAddr=0x%p iatSize=0x%X "
       "createNewIat=%d",
@@ -389,6 +410,18 @@ int WINAPI ScyllaIatFixAutoW(DWORD dwProcessId, DWORD_PTR imagebase,
   } catch (...) {
     ScyllaNativeLog(
         "ScyllaIatFixAutoW: EXCEPTION caught -> SCY_ERROR_IATWRITE");
+    return SCY_ERROR_IATWRITE;
+  }
+}
+
+int WINAPI ScyllaIatFixAutoW(DWORD dwProcessId, DWORD_PTR imagebase,
+                             DWORD_PTR iatAddr, DWORD iatSize,
+                             BOOL createNewIat, const WCHAR* dumpFile,
+                             const WCHAR* iatFixFile) {
+  __try {
+    return ScyllaIatFixAutoWImpl(dwProcessId, imagebase, iatAddr, iatSize,
+                                 createNewIat, dumpFile, iatFixFile);
+  } __except (ScyllaSehFilter("ScyllaIatFixAutoW", GetExceptionCode())) {
     return SCY_ERROR_IATWRITE;
   }
 }
