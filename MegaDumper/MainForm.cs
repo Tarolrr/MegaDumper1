@@ -2323,7 +2323,7 @@ namespace Mega_Dumper
                                 ScyllaLog(ddirs.dumps, $"CALL FixImportsAutoDetect file='{Path.GetFileName(dumpedFile)}' imageBase=0x{imageBase:X}");
 
                                 // Use simple auto-detect logic with Scylla
-                                ScyllaError result = MegaDumper.ScyllaBindings.FixImportsAutoDetect(
+                                MegaDumper.ScyllaError result = MegaDumper.ScyllaBindings.FixImportsAutoDetect(
                                     processId,
                                     imageBase,
                                     imageBase, // Use image base as OEP guess for raw dumps
